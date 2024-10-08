@@ -15,16 +15,15 @@ if not GITHUB_TOKEN:
 # Initialize GitHub connection
 g = Github(GITHUB_TOKEN)
 
-# Organization name where the repositories should be created
-ORG_NAME = "capgemini-cg-demo"
-
 # GitHub repo where the CI templates are stored
 CI_TEMPLATE_REPO = "capgemini-ga-demo/github_centralized_workflows"
 CI_TEMPLATE_BRANCH = "develop"
 CI_TEMPLATE_PATH = "templates"
 
-# File to store target repository URLs in org/repo format
+# CSV file paths
+source_repos_file = "source_repos.csv"
 target_repos_file = "target_repos.csv"
+csv_file_path = "migration_summary.csv"
 
 # Build system file indicators
 build_systems = {
@@ -49,9 +48,6 @@ build_systems = {
     'dotNET_SDK': 'global.json',
     'dotNET_NuGet': 'packages.config'
 }
-
-# CSV file path
-csv_file_path = "migration_summary.csv"
 
 def print_separator_with_repo_name(repo_name, phase="Starting migration"):
     """Prints a separator line with the repo_name in the middle."""
@@ -108,26 +104,38 @@ def fetch_ci_file_from_github(build_system):
         print(f"Error fetching Centralized Workflow File for {build_system}: {e}")
         return None
 
-def create_or_update_repo(repo_name):
-    """Create or update a repository in the specified organization."""
+def create_or_update_repo(target_repo):
+    """Create or update the target repository if it doesn't exist."""
+    org_name, repo_name = target_repo.split('/')
     try:
-        repo = g.get_organization(ORG_NAME).get_repo(repo_name)
-        print(f"Repository '{repo_name}' already exists. Updating...")
+        org = g.get_organization(org_name)
+        repo = org.get_repo(repo_name)
+        print(f"Repository '{repo_name}' already exists in the target organization '{org_name}'.")
         return repo
     except Exception:
         try:
-            print(f"Creating repository '{repo_name}' under organization '{ORG_NAME}'...")
-            repo = g.get_organization(ORG_NAME).create_repo(repo_name)
-            print(f"\033[92mRepository '{repo.name}' created successfully.\033[0m")  # Green for success
+            print(f"Creating repository '{repo_name}' in the organization '{org_name}'...")
+            repo = g.get_organization(org_name).create_repo(repo_name)
+            print(f"\033[92mRepository '{repo.name}' created successfully.\033[0m")
             return repo
         except Exception as e:
-            print(f"Error creating repository '{repo_name}': {e}")
+            print(f"Error creating repository '{repo_name}' in organization '{org_name}': {e}")
             return None
 
-def push_branches_and_tags(local_repo_path, push_url):
-    """Push the branches and tags, excluding problematic refs like pull requests."""
+def push_branches_and_tags(local_repo_path, target_repo):
+    """Push the branches and tags to the target repository."""
     try:
         subprocess.run(['git', 'remote', 'rm', 'origin'], cwd=local_repo_path, check=True)
+
+        # Create or update target repo before pushing
+        repo = create_or_update_repo(target_repo)
+
+        if repo is None:
+            print(f"Failed to create or update target repository: {target_repo}. Aborting push.")
+            return
+
+        push_url = f'https://github.com/{target_repo}.git'
+
         subprocess.run(['git', 'remote', 'add', 'origin', push_url], cwd=local_repo_path, check=True)
 
         print(f"  - Pushing branches and tags to '{push_url}'...")
@@ -165,14 +173,6 @@ def log_migration_to_csv(source_url, target_url, migrated_with_workflow):
     else:
         print(f"Duplicate entry detected for {source_url}. Skipping logging.")
 
-def log_target_repo_url(target_url):
-    """Log successfully migrated repository target URLs to a text file in org/repo format (without .git)."""
-    # Extract org/repo from full target URL and ensure no .git is added
-    org_repo = target_url.replace("https://github.com/", "").rstrip(".git")
-    with open(target_repos_file, mode='a') as file:
-        file.write(org_repo + '\n')
-    print(f"Added target repo URL '{org_repo}' to target_repos.txt.")
-
 # Helper function to remove read-only permission before deleting files
 def remove_readonly(func, path, exc_info):
     """Change the file to writable before trying to delete it."""
@@ -188,24 +188,43 @@ def cleanup_directory(directory_path):
         print(f"  - Error cleaning up {directory_path}: {e}")
 
 if __name__ == "__main__":
-    file_path = "source_repos.csv"
+    # Load source and target repositories
+    source_repos = load_repositories_from_file(source_repos_file)
+    target_repos = load_repositories_from_file(target_repos_file)
     
-    repos = load_repositories_from_file(file_path)
-    
-    if not repos:
-        print("No repositories found in the file.")
+    if not source_repos or not target_repos:
+        print("No repositories found in the input files.")
+    elif len(source_repos) != len(target_repos):
+        print("Mismatch between the number of source and target repositories.")
     else:
-        for repo_name in repos:
-            print_separator_with_repo_name(repo_name, phase="Starting migration")
+        for source_repo, target_repo in zip(source_repos, target_repos):
+            print_separator_with_repo_name(source_repo, phase="Starting migration")
 
-            primary_language, build_system = detect_language_and_build_system(repo_name)
+            primary_language, build_system = detect_language_and_build_system(source_repo)
             if primary_language and build_system:
-                print(f"Repository: {repo_name}")
+                print(f"Source Repository: {source_repo}")
                 print(f"  - Primary Language: {primary_language}")
                 print(f"  - Build System(s): {build_system}")
                 
-                source_repo = g.get_repo(repo_name)
+                # Clone the source repository
+                local_repo_name = source_repo.split('/')[-1]
+                local_repo_path = os.path.join(os.getcwd(), f"{local_repo_name}-repo")
 
+                if os.path.exists(local_repo_path):
+                    print(f"  - Directory '{local_repo_name}-repo' already exists. Removing it.")
+                    shutil.rmtree(local_repo_path, onerror=remove_readonly)
+
+                print(f"  - Cloning the source repository as a mirror to '{local_repo_name}-repo'...")
+                subprocess.run(['git', 'clone', '--mirror', f'https://github.com/{source_repo}.git', local_repo_path], check=True)
+
+                temporary_work_dir = os.path.join(os.getcwd(), f"{local_repo_name}-worktree")
+                if os.path.exists(temporary_work_dir):
+                    print(f"  - Temporary worktree directory '{temporary_work_dir}' already exists. Removing it.")
+                    shutil.rmtree(temporary_work_dir)
+
+                subprocess.run(['git', 'clone', local_repo_path, temporary_work_dir], check=True)
+
+                # Optionally fetch CI file and commit it
                 build_system_list = build_system.split(', ')  
                 ci_found = False
                 ci_content = None
@@ -217,23 +236,6 @@ if __name__ == "__main__":
                         break
                     else:
                         print(f"\033[91m  - Centralized Workflow File {system.strip()}-ci.yml does not exist in Centralized Workflow Repository.\033[0m")
-
-                local_repo_name = repo_name.split('/')[-1]
-                local_repo_path = os.path.join(os.getcwd(), f"{local_repo_name}-repo")
-
-                if os.path.exists(local_repo_path):
-                    print(f"  - Directory '{local_repo_name}-repo' already exists. Removing it.")
-                    shutil.rmtree(local_repo_path, onerror=remove_readonly)
-
-                print(f"  - Cloning the repository as a mirror to '{local_repo_name}-repo'...")
-                subprocess.run(['git', 'clone', '--mirror', f'https://github.com/{repo_name}.git', local_repo_path], check=True)
-
-                temporary_work_dir = os.path.join(os.getcwd(), f"{local_repo_name}-worktree")
-                if os.path.exists(temporary_work_dir):
-                    print(f"  - Temporary worktree directory '{temporary_work_dir}' already exists. Removing it.")
-                    shutil.rmtree(temporary_work_dir)
-
-                subprocess.run(['git', 'clone', local_repo_path, temporary_work_dir], check=True)
 
                 if ci_found and ci_content:
                     print(f"  - Saving Centralized Workflow File to '{temporary_work_dir}/.github/workflows/'...")
@@ -252,35 +254,26 @@ if __name__ == "__main__":
                     except subprocess.CalledProcessError as e:
                         print(f"\033[91m  - Error committing or pushing the CI file: {e}\033[0m")
 
-                repo = create_or_update_repo(local_repo_name)
+                # Push branches and tags to the target repository
+                push_branches_and_tags(local_repo_path, target_repo)
 
-                if repo:
-                    push_url = f'https://github.com/{ORG_NAME}/{local_repo_name}.git'
-                    push_branches_and_tags(local_repo_path, push_url)
+                time.sleep(10)
 
-                    time.sleep(10)
+                # Log migration details
+                source_url = f'https://github.com/{source_repo}.git'
+                log_migration_to_csv(source_url, f'https://github.com/{target_repo}.git', ci_found)
 
-                    source_url = f'https://github.com/{repo_name}.git'
-                    target_url = push_url
-                    log_migration_to_csv(source_url, target_url, ci_found)
+                # Run garbage collection to release any locks before cleanup
+                subprocess.run(['git', 'gc'], cwd=temporary_work_dir, check=True)
 
-                    # Log successfully migrated repository URL in org/repo.git format
-                    log_target_repo_url(target_url)
+                # Clean up local mirrored repository
+                cleanup_directory(local_repo_path)
 
-                    # Run garbage collection to release any locks before cleanup
-                    subprocess.run(['git', 'gc'], cwd=temporary_work_dir, check=True)
+                # Clean up temporary working directory
+                cleanup_directory(temporary_work_dir)
 
-                    # Clean up local mirrored repository
-                    cleanup_directory(local_repo_path)
-
-                    # Clean up temporary working directory
-                    cleanup_directory(temporary_work_dir)
-
-                    print(f"\033[92m  - Migration complete for repository: {repo_name}\033[0m")
-                else:
-                    print(f"\033[91mFailed to create or update repository '{local_repo_name}' in organization '{ORG_NAME}'.\033[0m")
-
+                print(f"\033[92m  - Migration complete for repository: {source_repo}\033[0m")
             else:
-                print(f"\033[91mCould not determine the language or build system for repository: {repo_name}\033[0m")
+                print(f"\033[91mCould not determine the language or build system for repository: {source_repo}\033[0m")
 
-            print_separator_with_repo_name(repo_name, phase="End of migration")
+            print_separator_with_repo_name(source_repo, phase="End of migration")
