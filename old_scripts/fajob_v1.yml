@@ -1,0 +1,188 @@
+name: Build and Publish Docker Image
+
+on:
+  push:
+    branches:
+      - main  # Trigger on push to the main branch
+
+jobs:
+  build:
+    runs-on: windows-latest  # Use a Windows runner for PowerShell execution
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Set up PowerShell
+        uses: actions/setup-powershell@v2
+
+      - name: Set up Docker
+        uses: docker/setup-buildx-action@v2
+
+      - name: Install Docker CLI
+        run: |
+          # Install Docker CLI if not already available in the image
+          Invoke-WebRequest -Uri https://download.docker.com/win/static/stable/x86_64/docker-20.10.16.zip -OutFile docker.zip
+          Expand-Archive -Path docker.zip -DestinationPath $Env:ProgramFiles\Docker
+          $env:Path += ";$Env:ProgramFiles\Docker\Docker"
+
+      - name: Set environment variables
+        run: |
+          echo "BASE_IMAGE=your-base-image-name" >> $GITHUB_ENV
+          echo "QUAY=ghcr.io" >> $GITHUB_ENV  # GitHub Container Registry
+          echo "BASE_TAG=your-base-tag" >> $GITHUB_ENV
+          echo "deployerId=your-deployer-id" >> $GITHUB_ENV
+
+      - name: Authenticate to GitHub Package Registry
+        run: |
+          echo "## Authenticating with GitHub Packages"
+          echo "Setting up NuGet configuration for GitHub Packages"
+          mkdir -Force "$env:USERPROFILE\.nuget"
+          Add-Content -Path "$env:USERPROFILE\.nuget\NuGet.Config" -Value '<configuration><packageSources><add key="GitHubPackages" value="https://nuget.pkg.github.com/your-github-username/index.json" /></packageSources></configuration>'
+
+      - name: Run PowerShell Script
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          
+          function ConvertTo-Hashtable {
+              [CmdletBinding()]
+              [OutputType('hashtable')]
+              param (
+                  [Parameter(ValueFromPipeline)]
+                  $InputObject
+              )
+              process {
+                  if ($null -eq $InputObject) {
+                      return $null
+                  }
+
+                  if ($InputObject -is [System.Collections.IEnumerable] -and $InputObject -isnot [string]) {
+                      $collection = @(
+                          foreach ($object in $InputObject) {
+                              ConvertTo-Hashtable -InputObject $object
+                          }
+                      )
+                      Write-Output -NoEnumerate $collection
+                  }
+                  elseif ($InputObject -is [psobject]) {
+                      $hash = @{}
+                      foreach ($property in $InputObject.PSObject.Properties) {
+                          $hash[$property.Name] = ConvertTo-Hashtable -InputObject $property.Value
+                      }
+                      $hash
+                  }
+                  else {
+                      $InputObject
+                  }
+              }
+          }
+
+          Write-Output "[INFO] Gathering manifests..."
+          $files = $(Get-ChildItem -Path ".\${env:BASE_IMAGE}" -Recurse -File -Include *manifest.json*)
+          
+          $content = @()
+          For ($i = 0; $i -lt $files.Count; $i++) {
+              $content += $($files[$i] | Get-Content -Raw | ConvertFrom-Json | ConvertTo-Hashtable)
+          }
+          
+          $packages = @{}
+          For ($i = 0; $i -lt $content.Count; $i++) {
+              $keys = $content[$i].Keys -as [string[]]
+              For ($n = 0; $n -lt $keys.Count; $n++) {
+                  $value = $content[$i].$($keys[$n])
+                  If (!$packages.ContainsKey($keys[$n])) {
+                      $packages.Add($keys[$n], $value)
+                  }
+                  ElseIf ($packages.$($keys[$n]).version -lt $value.version) {
+                      $packages.$($keys[$n]) = $value
+                  }
+                  ElseIf (($packages.$($keys[$n]).version -eq $value.version) -and (($packages.$($keys[$n]).build -lt $value.build -and $packages.$($keys[$n]).build -ne 'latest') -or $value.build -eq 'latest')) {
+                      $packages.$($keys[$n]) = $value
+                  }
+              }
+          }
+
+          # Convert K,V pairs back to JSON so we can log it to a file
+          $packages | ConvertTo-Json | Out-File -FilePath './manifest.json' -NoNewline -Force
+          Write-Output "[INFO] Manifest saved."
+
+          Write-Output "[INFO] Fetching NuGet Packages..."
+          $package_version = ""
+          $package_build = ""
+          
+          $keys = $packages.Keys -as [string[]]
+          For ($i = 0; $i -lt $keys.Count; $i++) {
+              $name = $packages.$($keys[$i]).name
+              if($name -eq "PACKAGE") { 
+                  $package_version = $packages[$keys[$i]].version
+                  $package_build = $packages[$keys[$i]].build
+                  Write-Output "package version $($package_version)"
+                  continue
+              }
+
+              $myUri = "https://nuget.pkg.github.com/your-github-username/index.json"
+              $headers = @{
+                  "Authorization" = "Bearer $env:GITHUB_TOKEN"
+              }
+
+              $response = Invoke-RestMethod -Uri $myUri -Headers $headers
+              $links = $response.links -as [array]
+              $version = $packages[$keys[$i]].version
+              Write-Output "Fetched version $version"
+              
+              $buildlist = @()
+              For ($n = 0; $n -lt $links.Count; $n++) {
+                  $build = $packages.$($keys[$i]).build
+                  If ($build -ne "latest") {
+                      If ($links[$n].href -like "*$version.$build-*") {
+                          $myUri = "https://nuget.pkg.github.com/your-github-username/index.json"
+                          Write-Output "Downloading $myUri..."
+                          $myFile = ".\build\nupkg\temp${n}.zip"
+                          Invoke-WebRequest -Uri $myUri -OutFile $myFile
+                          Expand-Archive -Path $myFile .\build\nupkg\ -Force
+                          $name = [string]$packages.$($keys[$i]).name
+                          New-Item -ItemType "directory" -Path ".\build\nupkg\" -Name $name -Force
+                          New-Item -ItemType "directory" -Path ".\build\bin\" -Name $name -Force
+                          Expand-Archive $myFile ".\build\nupkg\$name\" -Force
+                          Get-ChildItem -Path ".\build\nupkg\$name\" -Filter *.dll -Recurse | Move-Item -Destination ".\build\bin\$name\" -Force
+                          Get-ChildItem -Path ".\build\nupkg\$name\" -Filter *.deps.json -Recurse | Move-Item -Destination ".\build\bin\$name\" -Force
+                          Get-ChildItem -Path ".\build\nupkg\$name\" -Filter *.pdb -Recurse | Move-Item -Destination ".\build\bin\$name\" -Force
+                          Get-ChildItem -Path ".\build\bin\$name\" | Write-Output
+                      }
+                  } Else {
+                      $id = $(Select-String -InputObject $links[$n].href -Pattern "(?<=\.).+?(?=\-)").matches[0].Value
+                      $arr = $id.split(".")
+                      $buildlist += [int]$arr[$arr.Count - 1]
+                  }
+              }
+              
+              If ($packages.$($keys[$i]).build -eq "latest") {
+                  $lastbuild = $($buildlist | Sort-Object -Descending)[0]
+                  For ($n = 0; $n -lt $links.Count; $n++) {
+                      If ($links[$n].href -like "*.$version.$lastbuild-*") {
+                          $myUri = "https://nuget.pkg.github.com/your-github-username/index.json"
+                          Write-Output "Downloading $myUri..."
+                          $myFile = ".\build\nupkg\temp${n}.zip"
+                          Invoke-WebRequest -Uri $myUri -OutFile $myFile
+                          $name = [string]$packages.$($keys[$i]).name
+                          New-Item -ItemType "directory" -Path ".\build\nupkg\" -Name $name -Force
+                          New-Item -ItemType "directory" -Path ".\build\bin\" -Name $name -Force
+                          Expand-Archive $myFile ".\build\nupkg\$name\" -Force
+                          Get-ChildItem -Path ".\build\nupkg\$name\" -Filter *.dll -Recurse | Move-Item -Destination ".\build\bin\$name\" -Force
+                          Get-ChildItem -Path ".\build\nupkg\$name\" -Filter *.deps.json -Recurse | Move-Item -Destination ".\build\bin\$name\" -Force
+                          Get-ChildItem -Path ".\build\nupkg\$name\" -Filter *.pdb -Recurse | Move-Item -Destination ".\build\bin\$name\" -Force
+                          Get-ChildItem -Path ".\build\bin\$name\" | Write-Output
+                      }
+                  }
+              }
+          }
+
+      - name: Build and Publish Docker Image
+        run: |
+          Write-Output "[INFO] Creating & Publishing Docker Image for ${env:QUAY}/${env:BASE_IMAGE}-base:ext-${env:BASE_TAG}"
+          docker build --pull . -f .\${env:BASE_IMAGE}\Dockerfile -t ${env:QUAY}/${env:BASE_IMAGE}-base:ext-${env:BASE_TAG}-$($package_version) --no-cache --build-arg QUAY=${env:QUAY} --build-arg BASE_IMAGE=${env:BASE_IMAGE}-base --build-arg BASE_TAG=${env:BASE_TAG}
+          docker login -u ${env:deployerId} -p ${env:GITHUB_TOKEN} ghcr.io
+          docker push ${env:QUAY}/${env:BASE_IMAGE}-base:ext-${env:BASE_TAG}-$($package_version)
+          docker tag ${env:QUAY}/${env:BASE_IMAGE}-base:ext-${env:BASE_TAG}-$($package_version) ${env:QUAY}/${env:BASE_IMAGE}-base:latest
+          docker push ${env:QUAY}/${env:BASE_IMAGE}-base:latest
